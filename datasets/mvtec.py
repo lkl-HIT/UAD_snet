@@ -84,14 +84,14 @@ class MVTecDataset(torch.utils.data.Dataset):
         self.transform_img = [
             transforms.Resize(resize),
             # transforms.RandomRotation(rotate_degrees, transforms.InterpolationMode.BILINEAR),
-            transforms.ColorJitter(brightness_factor, contrast_factor, saturation_factor),
-            transforms.RandomHorizontalFlip(h_flip_p),
-            transforms.RandomVerticalFlip(v_flip_p),
-            transforms.RandomGrayscale(gray_p),
+            transforms.ColorJitter(brightness_factor, contrast_factor, saturation_factor),#数据增强->随机亮度，对比度，饱和度变换
+            transforms.RandomHorizontalFlip(h_flip_p),#数据增强->随机水平翻转
+            transforms.RandomVerticalFlip(v_flip_p),#数据增强->随机垂直翻转
+            transforms.RandomGrayscale(gray_p),#数据增强->随机灰度
             transforms.RandomAffine(rotate_degrees, 
                                     translate=(translate, translate),
                                     scale=(1.0-scale, 1.0+scale),
-                                    interpolation=transforms.InterpolationMode.BILINEAR),
+                                    interpolation=transforms.InterpolationMode.BILINEAR),#数据增强->随机仿射变换
             transforms.CenterCrop(imagesize),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),

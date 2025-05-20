@@ -79,46 +79,118 @@ class RescaleSegmentor:
         self.target_size = target_size
         self.smoothing = 4
 
-    def convert_to_segmentation(self, patch_scores, features):
+    # def convert_to_segmentation(self, patch_scores, features):
 
+    #     with torch.no_grad():
+    #         if isinstance(patch_scores, np.ndarray):
+    #             patch_scores = torch.from_numpy(patch_scores)
+    #         _scores = patch_scores.to(self.device)
+    #         _scores = _scores.unsqueeze(1)
+    #         _scores = F.interpolate(
+    #             _scores, size=self.target_size, mode="bilinear", align_corners=False
+    #         )
+    #         _scores = _scores.squeeze(1)
+    #         patch_scores = _scores.cpu().numpy()
+
+    #         if isinstance(features, np.ndarray):
+    #             features = torch.from_numpy(features)
+    #         features = features.to(self.device).permute(0, 3, 1, 2)
+    #         if self.target_size[0] * self.target_size[1] * features.shape[0] * features.shape[1] >= 2**31:
+    #             subbatch_size = int((2**31-1) / (self.target_size[0] * self.target_size[1] * features.shape[1]))
+    #             interpolated_features = []
+    #             for i_subbatch in range(int(features.shape[0] / subbatch_size + 1)):
+    #                 subfeatures = features[i_subbatch*subbatch_size:(i_subbatch+1)*subbatch_size]
+    #                 subfeatures = subfeatures.unsuqeeze(0) if len(subfeatures.shape) == 3 else subfeatures
+    #                 subfeatures = F.interpolate(
+    #                     subfeatures, size=self.target_size, mode="bilinear", align_corners=False
+    #                 )
+    #                 interpolated_features.append(subfeatures)
+    #             features = torch.cat(interpolated_features, 0)
+    #         else:
+    #             features = F.interpolate(
+    #                 features, size=self.target_size, mode="bilinear", align_corners=False
+    #             )
+    #         features = features.cpu().numpy()
+
+    #     return [
+    #         ndimage.gaussian_filter(patch_score, sigma=self.smoothing)
+    #         for patch_score in patch_scores
+    #     ], [ 
+    #         feature
+    #         for feature in features
+    #     ]
+
+#采用pytorch实现高斯模糊而并非numpy方法
+    def gaussian_kernel(self, kernel_size, sigma):
+        """生成高斯核"""
+        x_coord = torch.arange(kernel_size, dtype=torch.float32, device=self.device)
+        x_grid = x_coord.repeat(kernel_size).view(kernel_size, kernel_size)
+        y_grid = x_grid.t()
+        xy_grid = torch.stack([x_grid, y_grid], dim=-1)
+
+        mean = (kernel_size - 1) / 2.
+        variance = sigma ** 2.
+
+        # 计算高斯核
+        gaussian_kernel = torch.exp(
+            -torch.sum((xy_grid - mean) ** 2., dim=-1) / (2 * variance)
+        )
+
+        # 归一化
+        gaussian_kernel = gaussian_kernel / gaussian_kernel.sum()
+
+        # 调整形状以用于卷积
+        gaussian_kernel = gaussian_kernel.view(1, 1, kernel_size, kernel_size)
+        return gaussian_kernel
+
+    def gaussian_blur(self, x, kernel_size, sigma):
+        """应用高斯模糊"""
+        kernel = self.gaussian_kernel(kernel_size, sigma)
+        padding = kernel_size // 2
+        
+        return F.conv2d(x, kernel, padding=padding, groups=x.size(1))
+
+    def convert_to_segmentation(self, patch_scores, features = None):
         with torch.no_grad():
-            if isinstance(patch_scores, np.ndarray):
-                patch_scores = torch.from_numpy(patch_scores)
-            _scores = patch_scores.to(self.device)
-            _scores = _scores.unsqueeze(1)
-            _scores = F.interpolate(
-                _scores, size=self.target_size, mode="bilinear", align_corners=False
+            # 转换 patch_scores 为张量
+            # if isinstance(patch_scores, np.ndarray):
+            #     patch_scores = torch.from_numpy(patch_scores)
+            # patch_scores = patch_scores.to(self.device)
+
+            # 对 patch scores 进行插值
+            patch_scores = F.interpolate(
+                patch_scores.unsqueeze(1), size=self.target_size, mode="bilinear", align_corners=False
             )
-            _scores = _scores.squeeze(1)
-            patch_scores = _scores.cpu().numpy()
 
-            if isinstance(features, np.ndarray):
-                features = torch.from_numpy(features)
-            features = features.to(self.device).permute(0, 3, 1, 2)
-            if self.target_size[0] * self.target_size[1] * features.shape[0] * features.shape[1] >= 2**31:
-                subbatch_size = int((2**31-1) / (self.target_size[0] * self.target_size[1] * features.shape[1]))
-                interpolated_features = []
-                for i_subbatch in range(int(features.shape[0] / subbatch_size + 1)):
-                    subfeatures = features[i_subbatch*subbatch_size:(i_subbatch+1)*subbatch_size]
-                    subfeatures = subfeatures.unsuqeeze(0) if len(subfeatures.shape) == 3 else subfeatures
-                    subfeatures = F.interpolate(
-                        subfeatures, size=self.target_size, mode="bilinear", align_corners=False
-                    )
-                    interpolated_features.append(subfeatures)
-                features = torch.cat(interpolated_features, 0)
-            else:
-                features = F.interpolate(
-                    features, size=self.target_size, mode="bilinear", align_corners=False
-                )
-            features = features.cpu().numpy()
+            # 应用高斯模糊
+            kernel_size = int(2 * (self.smoothing * 3) + 1)  # 3-sigma rule
+            patch_scores = self.gaussian_blur(patch_scores, kernel_size, self.smoothing).squeeze(1)
 
-        return [
-            ndimage.gaussian_filter(patch_score, sigma=self.smoothing)
-            for patch_score in patch_scores
-        ], [ 
-            feature
-            for feature in features
-        ]
+            # # 处理特征
+            # # if isinstance(features, np.ndarray):
+            # #     features = torch.from_numpy(features)
+            # features = features.to(self.device).permute(0, 3, 1, 2)
+
+            # # 处理大型特征张量
+            # if self.target_size[0] * self.target_size[1] * features.shape[0] * features.shape[1] >= 2**31:
+            #     subbatch_size = int((2**31-1) / (self.target_size[0] * self.target_size[1] * features.shape[1]))
+            #     interpolated_features = []
+            #     for i_subbatch in range(int(features.shape[0] / subbatch_size + 1)):
+            #         subfeatures = features[i_subbatch*subbatch_size:(i_subbatch+1)*subbatch_size]
+            #         subfeatures = subfeatures.unsqueeze(0) if len(subfeatures.shape) == 3 else subfeatures
+            #         subfeatures = F.interpolate(
+            #             subfeatures, size=self.target_size, mode="bilinear", align_corners=False
+            #         )
+            #         interpolated_features.append(subfeatures)
+            #     features = torch.cat(interpolated_features, 0)
+            # else:
+            #     features = F.interpolate(
+            #         features, size=self.target_size, mode="bilinear", align_corners=False
+            #     )
+
+        return patch_scores
+
+        # return patch_scores, features
 
 
 class NetworkFeatureAggregator(torch.nn.Module):

@@ -24,6 +24,8 @@ LOGGER = logging.getLogger(__name__)
 
 _DATASETS = {
     "mvtec": ["datasets.mvtec", "MVTecDataset"],
+    "realiad": ["datasets.realiad", "RealIADDataset"],
+    "realiad_1": ["datasets.realiad", "RealIADDataset_1"],
 }
 
 
@@ -89,11 +91,11 @@ def run(
             LOGGER.info(
                 "Training models ({}/{})".format(i + 1, len(simplenet_list))
             )
-            # torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
 
             SimpleNet.set_model_dir(os.path.join(models_dir, f"{i}"), dataset_name)
             if not test:
-                i_auroc, p_auroc, pro_auroc = SimpleNet.train(dataloaders["training"], dataloaders["testing"])
+                i_auroc, p_auroc = SimpleNet.train(dataloaders["training"], dataloaders["testing"])
             else:
                 # BUG: the following line is not using. Set test with True by default.
                 # i_auroc, p_auroc, pro_auroc =  SimpleNet.test(dataloaders["training"], dataloaders["testing"], save_segmentation_images)
@@ -104,7 +106,7 @@ def run(
                     "dataset_name": dataset_name,
                     "instance_auroc": i_auroc, # auroc,
                     "full_pixel_auroc": p_auroc, # full_pixel_auroc,
-                    "anomaly_pixel_auroc": pro_auroc,
+                    # "anomaly_pixel_auroc": pro_auroc,
                 }
             )
 
@@ -229,7 +231,7 @@ def net(
 @click.option("--subdatasets", "-d", multiple=True, type=str, required=True)
 @click.option("--train_val_split", type=float, default=1, show_default=True)
 @click.option("--batch_size", default=2, type=int, show_default=True)
-@click.option("--num_workers", default=2, type=int, show_default=True)
+@click.option("--num_workers", default=8, type=int, show_default=True)#debug=0，noraml=2
 @click.option("--resize", default=256, type=int, show_default=True)
 @click.option("--imagesize", default=224, type=int, show_default=True)
 @click.option("--rotate_degrees", default=0, type=int)
@@ -304,16 +306,16 @@ def dataset(
                 batch_size=batch_size,
                 shuffle=True,
                 num_workers=num_workers,
-                prefetch_factor=2,
+                prefetch_factor=None,     #debug=none
                 pin_memory=True,
             )
 
             test_dataloader = torch.utils.data.DataLoader(
                 test_dataset,
                 batch_size=batch_size,
-                shuffle=False,
+                shuffle=True,              #nomal -> False ,modify -> True
                 num_workers=num_workers,
-                prefetch_factor=2,
+                prefetch_factor=None,      #debug=none，normal=2
                 pin_memory=True,
             )
 

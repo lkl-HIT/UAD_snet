@@ -22,6 +22,15 @@ import common
 import metrics
 from utils import plot_segmentation_images
 
+#内存监测
+import psutil
+import sys
+import gc
+import pysnooper
+
+#gpu评估
+import torchmetrics
+
 LOGGER = logging.getLogger(__name__)
 
 def init_weight(m):
@@ -31,6 +40,42 @@ def init_weight(m):
     elif isinstance(m, torch.nn.Conv2d):
         torch.nn.init.xavier_normal_(m.weight)
 
+
+def log_memory_usage(tag=""):
+    process = psutil.Process(os.getpid())
+    mem_info = process.memory_info()
+    print(f"[{tag}] Memory usage: {mem_info.rss / 1024 ** 2:.2f} MB")
+
+def log_list_memory_usage(tag, *lists):
+    print(f"[{tag}] Memory usage:")
+    for i, lst in enumerate(lists):
+        size = sys.getsizeof(lst)
+        print(f"  List {i + 1}: {size / 1024:.2f} KB")
+
+def log_variable_memory_usage(tag, **variables):
+    """
+    打印变量的内存使用情况，包括 CPU 和 GPU。
+    
+    参数:
+        tag (str): 日志标签，用于标识当前监测的阶段。
+        variables (dict): 需要监测的变量，键为变量名，值为变量本身。
+    """
+    print(f"[{tag}] Variable Memory Usage:")
+    for name, var in variables.items():
+        if isinstance(var, torch.Tensor):
+            # 如果变量是 PyTorch 张量
+            if var.is_cuda:
+                # GPU 张量
+                gpu_memory = var.element_size() * var.nelement() / 1024 ** 2
+                print(f"  {name}: {gpu_memory:.2f} MB (GPU)")
+            else:
+                # CPU 张量
+                cpu_memory = var.element_size() * var.nelement() / 1024 ** 2
+                print(f"  {name}: {cpu_memory:.2f} MB (CPU)")
+        else:
+            # 非张量变量
+            size = sys.getsizeof(var) / 1024 ** 2
+            print(f"  {name}: {size:.2f} MB (Non-Tensor)")
 
 class Discriminator(torch.nn.Module):
     def __init__(self, in_planes, n_layers=1, hidden=None):
@@ -87,6 +132,36 @@ class Projection(torch.nn.Module):
         return x
 
 
+class EMA(torch.nn.Module):
+    def __init__(self, channels, factor=8):
+        super(EMA, self).__init__()
+        self.groups = factor
+        assert channels // self.groups > 0
+        self.softmax = torch.nn.Softmax(-1)
+        self.agp = torch.nn.AdaptiveAvgPool2d((1, 1))
+        self.pool_h = torch.nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = torch.nn.AdaptiveAvgPool2d((1, None))
+        self.gn = torch.nn.GroupNorm(channels // self.groups, channels // self.groups)
+        self.conv1x1 = torch.nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=1, stride=1, padding=0)
+        self.conv3x3 = torch.nn.Conv2d(channels // self.groups, channels // self.groups, kernel_size=3, stride=1, padding=1)
+        self.apply(init_weight)
+
+    def forward(self, x):
+        b, c, h, w = x.size()
+        group_x = x.reshape(b * self.groups, -1, h, w)  # b*g,c//g,h,w
+        x_h = self.pool_h(group_x)
+        x_w = self.pool_w(group_x).permute(0, 1, 3, 2)
+        hw = self.conv1x1(torch.cat([x_h, x_w], dim=2))
+        x_h, x_w = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(group_x * x_h.sigmoid() * x_w.permute(0, 1, 3, 2).sigmoid())
+        x2 = self.conv3x3(group_x)
+        x11 = self.softmax(self.agp(x1).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x12 = x2.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        x21 = self.softmax(self.agp(x2).reshape(b * self.groups, -1, 1).permute(0, 2, 1))
+        x22 = x1.reshape(b * self.groups, c // self.groups, -1)  # b*g, c//g, hw
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * self.groups, 1, h, w)
+        return (group_x * weights.sigmoid()).reshape(b, c, h, w)
+
 class TBWrapper:
     
     def __init__(self, log_dir):
@@ -129,6 +204,8 @@ class SimpleNet(torch.nn.Module):
         lr=1e-3,
         pre_proj=0, # 1
         proj_layer_type=0,
+        #my modules
+        ema=1,
         **kwargs,
     ):
         pid = os.getpid()
@@ -183,6 +260,16 @@ class SimpleNet(torch.nn.Module):
             self.pre_projection = Projection(self.target_embed_dimension, self.target_embed_dimension, pre_proj, proj_layer_type)
             self.pre_projection.to(self.device)
             self.proj_opt = torch.optim.AdamW(self.pre_projection.parameters(), lr*.1)
+        
+        self.ema = ema
+        if self.ema > 0:
+            self.ema_layer2 = EMA(512, 1)
+            self.ema_layer2.to(self.device)
+            self.ema_layer3 = EMA(1024, 1)
+            self.ema_layer3.to(self.device)
+            # Combine parameters from both EMA layers for the optimizer
+            ema_parameters = list(self.ema_layer2.parameters()) + list(self.ema_layer3.parameters())
+            self.ema_opt = torch.optim.AdamW(ema_parameters, lr*.1)
 
         # Discriminator
         self.auto_noise = [auto_noise, None]
@@ -239,6 +326,11 @@ class SimpleNet(torch.nn.Module):
 
         features = [features[layer] for layer in self.layers_to_extract_from]
 
+        #ema
+        if self.ema > 0:
+            features[0] = self.ema_layer2(features[0])
+            features[1] = self.ema_layer3(features[1])
+ 
         for i, feat in enumerate(features):
             if len(feat.shape) == 3:
                 B, L, C = feat.shape
@@ -343,6 +435,13 @@ class SimpleNet(torch.nn.Module):
     
     def _evaluate(self, test_data, scores, segmentations, features, labels_gt, masks_gt):
         
+        #?
+        #scores (N, M)
+        #segmentations (N, 1, H, W)
+        #masks_gt (N, 1, H, W)
+        #features (N, C, H, W)
+        #labels_gt (N, )
+
         scores = np.squeeze(np.array(scores))
         img_min_scores = scores.min(axis=-1)
         img_max_scores = scores.max(axis=-1)
@@ -365,6 +464,7 @@ class SimpleNet(torch.nn.Module):
                 .max(axis=-1)
                 .reshape(-1, 1, 1, 1)
             )
+            #不知道这是不是一种数据增强的手段
             norm_segmentations = np.zeros_like(segmentations)
             for min_score, max_score in zip(min_scores, max_scores):
                 norm_segmentations += (segmentations - min_score) / max(max_score - min_score, 1e-2)
@@ -377,21 +477,81 @@ class SimpleNet(torch.nn.Module):
                 # segmentations, masks_gt
             full_pixel_auroc = pixel_scores["auroc"]
 
-            pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), 
-                                            norm_segmentations)
+            # pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), 
+            #                                 norm_segmentations)
         else:
-            full_pixel_auroc = -1 
-            pro = -1
+            full_pixel_auroc = -1
+            # pro = -1
 
-        return auroc, full_pixel_auroc, pro
-        
+        return auroc, full_pixel_auroc
     
-    def train(self, training_data, test_data):
+    def _evaluate_gpu(self, test_data, scores, segmentations, features, labels_gt, masks_gt, need_pauroc=False):
+        with torch.no_grad():
+            #scores (N, ) tensor
+            #segmentations (N, 1, H, W) tensor
+            #masks_gt (N, 1, H, W) tensor
+            #features (N, C, H, W) tensor
+            #labels_gt (N, ) tensor
+            scores = torch.stack(scores)
+            labels_gt = torch.stack(labels_gt).to(self.device)
+
+            img_min_scores = torch.amin(scores, dim=-1)
+            img_max_scores = torch.amax(scores, dim=-1)
+            scores = (scores - img_min_scores) / (img_max_scores - img_min_scores)
+
+            #I-AUROC
+            Iauroc_metrics = torchmetrics.AUROC(task="binary").to(self.device)
+            Iauroc_metrics.update(scores, labels_gt)
+            Iauroc = Iauroc_metrics.compute()
+
+            #P-AUROC
+            segmentations = torch.stack(segmentations)
+            masks_gt = torch.stack(masks_gt).to(self.device)
+
+            if len(masks_gt) > 0 and need_pauroc:
+                N, H, W = segmentations.shape
+                
+                segmentations_flat = segmentations.view(N, -1)
+                min_scores = torch.amin(segmentations_flat, dim=-1)
+                max_scores = torch.amax(segmentations_flat, dim=-1)
+                norm_segmentations = torch.zeros_like(segmentations,device=self.device)
+
+                for i in range(N):
+                    de = max_scores[i] - min_scores[i]
+                    de = torch.maximum(de, torch.tensor(1e-2, device=self.device))
+                    norm_segmentations += (segmentations - min_scores[i]) / de
+                
+                norm_segmentations = norm_segmentations / N
+
+                del segmentations_flat, min_scores, max_scores, de, segmentations
+                torch.cuda.empty_cache()
+
+                norm_segmentations = norm_segmentations.flatten()
+                masks_gt = masks_gt.flatten()
+
+                # Compute PRO score & PW Auroc for all images
+                Pauroc_metrics = torchmetrics.AUROC(task="binary").to(self.device)
+                Pauroc_metrics.update(norm_segmentations, masks_gt)
+                    # segmentations, masks_gt
+                Pauroc = Pauroc_metrics.compute()
+
+                del norm_segmentations, masks_gt
+                torch.cuda.empty_cache()
+
+                # pro = metrics.compute_pro(np.squeeze(np.array(masks_gt)), 
+                #                                 norm_segmentations)
+            else:
+                Pauroc = torch.tensor(-1.0, device=self.device) 
+
+
+        return Iauroc,Pauroc
+    
+    def train(self, training_data, test_data, load_model = False):
 
         
         state_dict = {}
         ckpt_path = os.path.join(self.ckpt_dir, "ckpt.pth")
-        if os.path.exists(ckpt_path):
+        if load_model and os.path.exists(ckpt_path):
             state_dict = torch.load(ckpt_path, map_location=self.device)
             if 'discriminator' in state_dict:
                 self.discriminator.load_state_dict(state_dict['discriminator'])
@@ -419,33 +579,34 @@ class SimpleNet(torch.nn.Module):
         best_record = None
         for i_mepoch in range(self.meta_epochs):
 
-            self._train_discriminator(training_data)
+            torch.cuda.empty_cache()
+            self._train_discriminator(training_data)#训练判别器
 
-            # torch.cuda.empty_cache()
+            torch.cuda.empty_cache()
             scores, segmentations, features, labels_gt, masks_gt = self.predict(test_data)
-            auroc, full_pixel_auroc, pro = self._evaluate(test_data, scores, segmentations, features, labels_gt, masks_gt)
+            auroc, full_pixel_auroc = self._evaluate_gpu(test_data, scores, segmentations, features, labels_gt, masks_gt)
             self.logger.logger.add_scalar("i-auroc", auroc, i_mepoch)
             self.logger.logger.add_scalar("p-auroc", full_pixel_auroc, i_mepoch)
-            self.logger.logger.add_scalar("pro", pro, i_mepoch)
+            # self.logger.logger.add_scalar("pro", pro, i_mepoch)
 
             if best_record is None:
-                best_record = [auroc, full_pixel_auroc, pro]
+                best_record = [auroc, full_pixel_auroc]
                 update_state_dict(state_dict)
                 # state_dict = OrderedDict({k:v.detach().cpu() for k, v in self.state_dict().items()})
             else:
                 if auroc > best_record[0]:
-                    best_record = [auroc, full_pixel_auroc, pro]
+                    best_record = [auroc, full_pixel_auroc]
                     update_state_dict(state_dict)
                     # state_dict = OrderedDict({k:v.detach().cpu() for k, v in self.state_dict().items()})
                 elif auroc == best_record[0] and full_pixel_auroc > best_record[1]:
                     best_record[1] = full_pixel_auroc
-                    best_record[2] = pro 
+                    # best_record[2] = pro 
                     update_state_dict(state_dict)
                     # state_dict = OrderedDict({k:v.detach().cpu() for k, v in self.state_dict().items()})
 
-            print(f"----- {i_mepoch} I-AUROC:{round(auroc, 4)}(MAX:{round(best_record[0], 4)})"
-                  f"  P-AUROC{round(full_pixel_auroc, 4)}(MAX:{round(best_record[1], 4)}) -----"
-                  f"  PRO-AUROC{round(pro, 4)}(MAX:{round(best_record[2], 4)}) -----")
+            print(f"----- {i_mepoch} I-AUROC:{round(auroc.item(), 4)}(MAX:{round(best_record[0].item(), 4)})"
+                  f"  P-AUROC{round(full_pixel_auroc.item(), 4)}(MAX:{round(best_record[1].item(), 4)}) -----"
+                )
         
         torch.save(state_dict, ckpt_path)
         
@@ -457,7 +618,12 @@ class SimpleNet(torch.nn.Module):
         _ = self.forward_modules.eval()
         
         if self.pre_proj > 0:
-            self.pre_projection.train()
+            self.pre_projection.train()#进入训练模式
+        
+        if self.ema > 0:
+            self.ema_layer2.train()
+            self.ema_layer3.train()
+            
         self.discriminator.train()
         # self.feature_enc.eval()
         # self.feature_dec.eval()
@@ -474,6 +640,10 @@ class SimpleNet(torch.nn.Module):
                     self.dsc_opt.zero_grad()
                     if self.pre_proj > 0:
                         self.proj_opt.zero_grad()
+
+                    if self.ema > 0:
+                        self.ema_opt.zero_grad()
+
                     # self.dec_opt.zero_grad()
 
                     i_iter += 1
@@ -512,6 +682,10 @@ class SimpleNet(torch.nn.Module):
                     loss.backward()
                     if self.pre_proj > 0:
                         self.proj_opt.step()
+
+                    if self.ema > 0:
+                        self.ema_opt.step()
+
                     if self.train_backbone:
                         self.backbone_opt.step()
                     self.dsc_opt.step()
@@ -545,7 +719,7 @@ class SimpleNet(torch.nn.Module):
             return self._predict_dataloader(data, prefix)
         return self._predict(data)
 
-    def _predict_dataloader(self, dataloader, prefix):
+    def _predict_dataloader(self, dataloader, prefix, max_batch_size=600):
         """This function provides anomaly scores/maps for full dataloaders."""
         _ = self.forward_modules.eval()
 
@@ -558,18 +732,30 @@ class SimpleNet(torch.nn.Module):
         masks_gt = []
         from sklearn.manifold import TSNE
 
+        count = 0  # 添加计数器
         with tqdm.tqdm(dataloader, desc="Inferring...", leave=False) as data_iterator:
             for data in data_iterator:
+                if count >= max_batch_size:  # 限制只处理前 100 个数据
+                    break
+
                 if isinstance(data, dict):
-                    labels_gt.extend(data["is_anomaly"].numpy().tolist())
+                    labels_gt.extend(data["is_anomaly"])#不知道这步的内存消耗
                     if data.get("mask", None) is not None:
-                        masks_gt.extend(data["mask"].numpy().tolist())
+                        masks_gt.extend(data["mask"])#
                     image = data["image"]
                     img_paths.extend(data['image_path'])
                 _scores, _masks, _feats = self._predict(image)
-                for score, mask, feat, is_anomaly in zip(_scores, _masks, _feats, data["is_anomaly"].numpy().tolist()):
+                for score, mask, feat in zip(_scores, _masks, _feats):
                     scores.append(score)
                     masks.append(mask)
+
+                # count += 1  
+
+        #
+        # scores = [score_new.cpu() for score_new in scores]
+        # masks = [mask_new.cpu() for mask_new in masks]
+        # labels_gt = [label_new.cpu() for label_new in labels_gt]
+        # masks_gt = [mask_new.cpu() for mask_new in masks_gt]
 
         return scores, masks, features, labels_gt, masks_gt
 
@@ -591,25 +777,26 @@ class SimpleNet(torch.nn.Module):
 
             # features = features.cpu().numpy()
             # features = np.ascontiguousarray(features.cpu().numpy())
-            patch_scores = image_scores = -self.discriminator(features)
-            patch_scores = patch_scores.cpu().numpy()
-            image_scores = image_scores.cpu().numpy()
+            image_scores = -self.discriminator(features)
+            # patch_scores = patch_scores.cpu().numpy()
+            # image_scores = image_scores.cpu().numpy()
+            
+            #unpatch_scores
+            image_scores = image_scores.reshape(batchsize, -1, *image_scores.shape[1:])
+            patch_scores = image_scores
 
-            image_scores = self.patch_maker.unpatch_scores(
-                image_scores, batchsize=batchsize
-            )
+            
             image_scores = image_scores.reshape(*image_scores.shape[:2], -1)
             image_scores = self.patch_maker.score(image_scores)
 
-            patch_scores = self.patch_maker.unpatch_scores(
-                patch_scores, batchsize=batchsize
-            )
+            
             scales = patch_shapes[0]
             patch_scores = patch_scores.reshape(batchsize, scales[0], scales[1])
-            features = features.reshape(batchsize, scales[0], scales[1], -1)
-            masks, features = self.anomaly_segmentor.convert_to_segmentation(patch_scores, features)
 
-        return list(image_scores), list(masks), list(features)
+            features = features.reshape(batchsize, scales[0], scales[1], -1)
+            masks = self.anomaly_segmentor.convert_to_segmentation(patch_scores, features)#去除了对features进行处理
+
+        return image_scores, masks, features
 
     @staticmethod
     def _params_file(filepath, prepend=""):
